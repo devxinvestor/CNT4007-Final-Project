@@ -459,7 +459,6 @@ def peer_process(my_peer_id):
     # Main message handling loop
     def handle_messages():
         """Handle incoming messages from all peers"""
-        # TODO: Make logging messages begin with "[TIME]:"
         while True:
             for peer_id, sock in connections:
                 try:
