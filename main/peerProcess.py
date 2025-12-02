@@ -102,6 +102,19 @@ class Bitfield:
                 if i < self.num_pieces:
                     self.pieces[i] = (b == 1)
 
+    def has_interesting(self, other):
+        """Return True if other has pieces we don't"""
+        with self.lock:
+            for i in range(self.num_pieces):
+                if other.has_piece(i) and not self.pieces[i]:
+                    return True
+            return False
+
+    def missing_pieces(self):
+        """Return list of indices we do not have"""
+        with self.lock:
+            return [i for i in range(self.num_pieces) if not self.pieces[i]]
+
 
 # Message types as defined in the protocol
 class MessageType:
@@ -209,8 +222,8 @@ class HaveMessage(Message):
     def from_message(cls, message):
         if message.message_type != MessageType.HAVE:
             raise ValueError("Not a HAVE message")
-        piece_index = struct.unpack('>I', message.payload)[0]
-        return cls(piece_index)
+        # return the message (caller can unpack payload)
+        return message
 
 
 class BitfieldMessage(Message):
@@ -221,7 +234,7 @@ class BitfieldMessage(Message):
     def from_message(cls, message):
         if message.message_type != MessageType.BITFIELD:
             raise ValueError("Not a BITFIELD message")
-        return cls(message.payload)
+        return message
 
 
 class RequestMessage(Message):
@@ -233,8 +246,7 @@ class RequestMessage(Message):
     def from_message(cls, message):
         if message.message_type != MessageType.REQUEST:
             raise ValueError("Not a REQUEST message")
-        piece_index = struct.unpack('>I', message.payload)[0]
-        return cls(piece_index)
+        return message
 
 
 class PieceMessage(Message):
@@ -246,9 +258,7 @@ class PieceMessage(Message):
     def from_message(cls, message):
         if message.message_type != MessageType.PIECE:
             raise ValueError("Not a PIECE message")
-        piece_index = struct.unpack('>I', message.payload[:4])[0]
-        piece_data = message.payload[4:]
-        return cls(piece_index, piece_data)
+        return message
 
 
 # Message handler for parsing incoming messages
@@ -256,85 +266,97 @@ class MessageHandler:
     def __init__(self, logger):
         self.logger = logger
     
-    def send_handshake(self, socket, peer_id):
+    def send_handshake(self, sock, peer_id):
         """Send handshake message"""
         handshake = HandshakeMessage(peer_id)
-        socket.send(handshake.to_bytes())
+        sock.sendall(handshake.to_bytes())
     
-    def receive_handshake(self, socket):
+    def receive_handshake(self, sock):
         """Receive and parse handshake message"""
-        data = socket.recv(HandshakeMessage.TOTAL_LENGTH)
+        data = self.recv_exact(sock, HandshakeMessage.TOTAL_LENGTH)
         if len(data) != HandshakeMessage.TOTAL_LENGTH:
             raise ValueError(f"Invalid handshake length in receive_handshake: {len(data)}")
         
         handshake = HandshakeMessage.from_bytes(data)
         return handshake
     
-    def send_message(self, socket, message):
+    def send_message(self, sock, message):
         """Send a protocol message"""
         data = message.to_bytes()
-        socket.send(data)
+        sock.sendall(data)
     
-    def receive_message(self, socket):
-        """Receive and parse a protocol message"""
-        # First, read the 4-byte length field
-        length_data = socket.recv(4)
+    def receive_message(self, sock):
+        """Receive and parse a protocol message. Returns None on EOF."""
+        try:
+            length_data = self.recv_exact(sock, 4)
+        except ConnectionError:
+            return None
         if len(length_data) != 4:
-            raise ValueError("Could not read message length in receive_message")
+            return None
         
         message_length = struct.unpack('>I', length_data)[0]
+        try:
+            remaining = self.recv_exact(sock, message_length)
+        except ConnectionError:
+            return None
+        if len(remaining) != message_length:
+            return None
         
-        # Then read the rest of the message
-        remaining_data = socket.recv(message_length)
-        if len(remaining_data) != message_length:
-            raise ValueError(f"Could not read complete message in receive_message: expected {message_length}, got {len(remaining_data)}")
-        
-        # Parse the complete message
-        full_data = length_data + remaining_data
-        message = Message.from_bytes(full_data)
-        return message
+        full = length_data + remaining
+        msg = Message.from_bytes(full)
+        return msg
+    
+    def recv_exact(self, sock, n):
+        """Receive exactly n bytes from socket or raise ConnectionError"""
+        data = b''
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            if not chunk:
+                raise ConnectionError("Socket connection broken")
+            data += chunk
+        return data
     
     # Send message functions for each message type
-    def send_bitfield(self, socket, bitfield):
+    def send_bitfield(self, sock, bitfield):
         """Send bitfield message"""
         bitfield_data = bitfield.to_bytes()
         message = BitfieldMessage(bitfield_data)
-        self.send_message(socket, message)
+        self.send_message(sock, message)
     
-    def send_have(self, socket, piece_index):
+    def send_have(self, sock, piece_index):
         """Send have message"""
         message = HaveMessage(piece_index)
-        self.send_message(socket, message)
+        self.send_message(sock, message)
     
-    def send_interested(self, socket):
+    def send_interested(self, sock):
         """Send interested message"""
         message = InterestedMessage()
-        self.send_message(socket, message)
+        self.send_message(sock, message)
     
-    def send_not_interested(self, socket):
+    def send_not_interested(self, sock):
         """Send not interested message"""
         message = NotInterestedMessage()
-        self.send_message(socket, message)
+        self.send_message(sock, message)
     
-    def send_request(self, socket, piece_index):
+    def send_request(self, sock, piece_index):
         """Send request message"""
         message = RequestMessage(piece_index)
-        self.send_message(socket, message)
+        self.send_message(sock, message)
     
-    def send_piece(self, socket, piece_index, piece_data):
+    def send_piece(self, sock, piece_index, piece_data):
         """Send piece message"""
         message = PieceMessage(piece_index, piece_data)
-        self.send_message(socket, message)
+        self.send_message(sock, message)
     
-    def send_choke(self, socket):
+    def send_choke(self, sock):
         """Send choke message"""
         message = ChokeMessage()
-        self.send_message(socket, message)
+        self.send_message(sock, message)
     
-    def send_unchoke(self, socket):
+    def send_unchoke(self, sock):
         """Send unchoke message"""
         message = UnchokeMessage()
-        self.send_message(socket, message)
+        self.send_message(sock, message)
 
 
 def peer_process(my_peer_id):
@@ -394,9 +416,10 @@ def peer_process(my_peer_id):
                     connections.append((p.peer_id, s))
                     connection_info[p.peer_id] = {
                         'socket': s,
-                        'choked': True,
+                        'choked': False,           # simplified model: not using choking logic yet
                         'interested': False,
-                        'bitfield': None
+                        'bitfield': None,
+                        'requested': None          # track one outstanding request per peer
                     }
                     break
                 except ConnectionRefusedError:
@@ -416,12 +439,63 @@ def peer_process(my_peer_id):
             connections.append((p.peer_id, conn))
             connection_info[p.peer_id] = {
                 'socket': conn,
-                'choked': True,
+                'choked': False,           # simplified model
                 'interested': False,
-                'bitfield': None
+                'bitfield': None,
+                'requested': None
             }
 
-    # Exchange bitfields with all connected peers
+    # Helper functions for file I/O and broadcasting
+    def _ensure_placeholder():
+        """Create placeholder file in peer_dir if missing"""
+        file_path = os.path.join(peer_dir, common['FileName'])
+        if not os.path.exists(file_path):
+            try:
+                total_size = common['FileSize']
+                with open(file_path, 'wb') as f:
+                    f.write(b'\x00' * total_size)
+            except Exception as e:
+                logger.log(f"Error creating placeholder file: {e}")
+
+    def _save_piece(piece_index, piece_data):
+        """Save received piece into the file (creates placeholder file if necessary)"""
+        try:
+            file_path = os.path.join(peer_dir, common['FileName'])
+            piece_size = common['PieceSize']
+            total_size = common['FileSize']
+            # Create placeholder file if missing
+            if not os.path.exists(file_path):
+                with open(file_path, 'wb') as f:
+                    f.write(b'\x00' * total_size)
+            # Write piece at offset
+            with open(file_path, 'r+b') as f:
+                offset = piece_index * piece_size
+                f.seek(offset)
+                f.write(piece_data)
+        except Exception as e:
+            logger.log(f"Error saving piece {piece_index}: {e}")
+
+    def _read_piece(piece_index):
+        """Read a piece from file (if exists)"""
+        try:
+            file_path = os.path.join(peer_dir, common['FileName'])
+            piece_size = common['PieceSize']
+            with open(file_path, 'rb') as f:
+                f.seek(piece_index * piece_size)
+                return f.read(piece_size)
+        except Exception as e:
+            logger.log(f"Error reading piece {piece_index}: {e}")
+            return None
+
+    def _broadcast_have(piece_index):
+        """Broadcast a HAVE message to all connected peers"""
+        for pid, sock in connections:
+            try:
+                message_handler.send_have(sock, piece_index)
+            except Exception as e:
+                logger.log(f"Error broadcasting have to peer {pid}: {e}")
+
+    # After connecting, exchange bitfields with all connected peers
     for peer_id, sock in connections:
         try:
             # Send our bitfield if we have any pieces
@@ -431,6 +505,8 @@ def peer_process(my_peer_id):
             # Receive bitfield from peer
             try:
                 message = message_handler.receive_message(sock)
+                if message is None:
+                    raise ValueError("No message received when expecting bitfield")
                 if message.message_type == MessageType.BITFIELD:
                     bitfield_msg = BitfieldMessage.from_message(message)
                     peer_bitfield = Bitfield(num_pieces)
@@ -450,11 +526,15 @@ def peer_process(my_peer_id):
                     else:
                         message_handler.send_not_interested(sock)
                 else:
-                    raise ValueError(f"Expected bitfield from peer {peer_id}, got message type {message.message_type}")
+                    # If peer did not send bitfield (allowed if they have no pieces), handle gracefully
+                    # We'll not force an error; continue with empty bitfield
+                    connection_info[peer_id]['bitfield'] = Bitfield(num_pieces)
             except Exception as e:
-                raise ValueError(f"Error receiving bitfield from peer {peer_id}: {e}")
+                # If bitfield exchange fails, keep going but log
+                logger.log(f"Error receiving bitfield from peer {peer_id}: {e}")
+                connection_info[peer_id]['bitfield'] = Bitfield(num_pieces)
         except Exception as e:
-            raise ValueError(f"Error exchanging bitfield with peer {peer_id}: {e}")
+            logger.log(f"Error exchanging bitfield with peer {peer_id}: {e}")
 
     # Main message handling loop
     def handle_messages():
@@ -464,6 +544,8 @@ def peer_process(my_peer_id):
                 try:
                     sock.settimeout(0.1)
                     message = message_handler.receive_message(sock)
+                    if message is None:
+                        continue
                     
                     if message.message_type == MessageType.CHOKE:
                         connection_info[peer_id]['choked'] = True
@@ -472,6 +554,21 @@ def peer_process(my_peer_id):
                     elif message.message_type == MessageType.UNCHOKE:
                         connection_info[peer_id]['choked'] = False
                         logger.unchoked_by(peer_id)
+                        # When unchoked, request a piece if available
+                        # choose a piece randomly that peer has and we don't
+                        peer_bf = connection_info[peer_id]['bitfield']
+                        if peer_bf:
+                            candidates = []
+                            for i in range(num_pieces):
+                                if peer_bf.has_piece(i) and not bitfield.has_piece(i):
+                                    candidates.append(i)
+                            if candidates and connection_info[peer_id]['requested'] is None:
+                                choice = candidates[int(time.time() * 1000) % len(candidates)]
+                                try:
+                                    message_handler.send_request(sock, choice)
+                                    connection_info[peer_id]['requested'] = choice
+                                except Exception as e:
+                                    logger.log(f"Error sending request to peer {peer_id}: {e}")
                     
                     elif message.message_type == MessageType.INTERESTED:
                         connection_info[peer_id]['interested'] = True
@@ -482,39 +579,62 @@ def peer_process(my_peer_id):
                         logger.received_not_interested(peer_id)
                     
                     elif message.message_type == MessageType.HAVE:
-                        have_msg = HaveMessage.from_message(message)
-                        piece_index = have_msg.payload
+                        # unpack piece index from payload
+                        piece_index = struct.unpack('>I', message.payload)[0]
                         logger.received_have(peer_id, piece_index)
                         
                         # Update peer's bitfield
-                        if connection_info[peer_id]['bitfield']:
-                            connection_info[peer_id]['bitfield'].set_piece(piece_index)
+                        if connection_info[peer_id]['bitfield'] is None:
+                            connection_info[peer_id]['bitfield'] = Bitfield(num_pieces)
+                        connection_info[peer_id]['bitfield'].set_piece(piece_index)
+                        
+                        # If we don't have it, signal interest
+                        if not bitfield.has_piece(piece_index):
+                            try:
+                                message_handler.send_interested(sock)
+                                connection_info[peer_id]['interested'] = True
+                            except Exception as e:
+                                logger.log(f"Error sending interested to peer {peer_id}: {e}")
                     
                     elif message.message_type == MessageType.REQUEST:
-                        request_msg = RequestMessage.from_message(message)
-                        piece_index = request_msg.payload
-                        
-                        # Send piece if we have it and peer is not choked
-                        if bitfield.has_piece(piece_index) and not connection_info[peer_id]['choked']:
-                            # TODO: Send piece to peer
-                            pass
+                        # Peer requests a piece from us
+                        piece_index = struct.unpack('>I', message.payload)[0]
+                        # In simplified model we always upload if we have the piece
+                        if bitfield.has_piece(piece_index):
+                            data = None
+                            _ensure_placeholder()
+                            data = _read_piece(piece_index)
+                            if data is not None:
+                                try:
+                                    message_handler.send_piece(sock, piece_index, data)
+                                except Exception as e:
+                                    logger.log(f"Error sending piece to peer {peer_id}: {e}")
                     
                     elif message.message_type == MessageType.PIECE:
-                        piece_msg = PieceMessage.from_message(message)
-                        piece_index = piece_msg.payload[:4]
-                        piece_data = piece_msg.payload[4:]
+                        # receive piece payload and save
+                        piece_index = struct.unpack('>I', message.payload[:4])[0]
+                        piece_data = message.payload[4:]
                         
-                        # TODO: Save piece to file 
-
+                        # Save the piece
+                        _save_piece(piece_index, piece_data)
+                        
                         # Update bitfield
                         bitfield.set_piece(piece_index)
                         logger.downloaded_piece(piece_index, peer_id, bitfield.num_completed())
                         
+                        # Clear requested marker for this peer if it matches
+                        if connection_info[peer_id]['requested'] == piece_index:
+                            connection_info[peer_id]['requested'] = None
+                        
+                        # Broadcast HAVE to all peers
+                        _broadcast_have(piece_index)
+                        
                 except socket.timeout:
                     # No message available, continue to next peer
                     continue
-                except Exception as e:
-                    break
+                except Exception:
+                    # If a peer disconnects or any other error happens, ignore and continue
+                    continue
             
             # Check if download is complete
             if bitfield.is_complete():
@@ -531,7 +651,7 @@ def peer_process(my_peer_id):
     try:
         while True:
             time.sleep(2)
-            # Example: Log progress periodically
+            # If we become complete, break and allow graceful shutdown
             if bitfield.is_complete():
                 logger.download_complete()
                 break
@@ -541,7 +661,10 @@ def peer_process(my_peer_id):
     finally:
         server_socket.close()
         for _, s in connections:
-            s.close()
+            try:
+                s.close()
+            except:
+                pass
         logger.log("Connections closed. Peer exiting.")
 
 
