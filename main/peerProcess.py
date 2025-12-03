@@ -4,6 +4,7 @@ import time
 import threading
 import os
 import struct
+import random
 from datetime import datetime
 from config_reader import read_peer_info, read_common_config
 
@@ -34,32 +35,35 @@ class Logger:
         self.log(f"is connected from Peer {peer_id}.")
     
     def choked_by(self, peer_id):
-        self.log(f"is choked by {peer_id}")
+        self.log(f"is choked by {peer_id}.")
     
     def unchoked_by(self, peer_id):
-        self.log(f"is unchoked by {peer_id}")
+        self.log(f"is unchoked by {peer_id}.")
     
     def received_interested(self, peer_id):
-        self.log(f"received the 'interested' message from {peer_id}")
+        self.log(f"received the 'interested' message from {peer_id}.")
     
     def received_not_interested(self, peer_id):
-        self.log(f"received the 'not interested' message from {peer_id}")
+        self.log(f"received the 'not interested' message from {peer_id}.")
     
     def received_have(self, peer_id, piece_index):
-        self.log(f"received the 'have' message from {peer_id} for the piece {piece_index}")
+        self.log(f"received the 'have' message from {peer_id} for the piece {piece_index}.")
     
     def downloaded_piece(self, piece_index, from_peer_id, total_pieces):
-        self.log(f"has downloaded the piece {piece_index} from {from_peer_id}. Now the number of pieces it has is {total_pieces}")
+        self.log(f"has downloaded the piece {piece_index} from {from_peer_id}. Now the number of pieces it has is {total_pieces}.")
     
     def download_complete(self):
         self.log(f"has downloaded the complete file.")
+    
+    def preferred_neighbors(self, neighbor_list):
+        """Log preferred neighbors change"""
+        neighbor_str = ','.join(map(str, neighbor_list))
+        self.log(f"has the preferred neighbors {neighbor_str}.")
+    
+    def optimistic_unchoked(self, peer_id):
+        """Log optimistically unchoked neighbor change"""
+        self.log(f"has the optimistically unchoked neighbor {peer_id}.")
 
-    def file_status(self, has_file):
-        status = "has complete file" if has_file else "has no file initially"
-        self.log(f"Initialization: {status}.")
-
-    def shutdown(self):
-        self.log("Shutting down.")
 
 
 # Tracks which pieces of the file this peer currently has
@@ -93,14 +97,24 @@ class Bitfield:
     def to_bytes(self):
         """Serialize the bitfield into bytes"""
         with self.lock:
-            return bytes([1 if p else 0 for p in self.pieces])
+            # Calculate number of bytes needed (round up)
+            num_bytes = (self.num_pieces + 7) // 8
+            result = bytearray(num_bytes)
+            for i in range(self.num_pieces):
+                if self.pieces[i]:
+                    byte_idx = i // 8
+                    bit_idx = 7 - (i % 8)  # High bit to low bit (0-7)
+                    result[byte_idx] |= (1 << bit_idx)
+            return bytes(result)
 
     def from_bytes(self, data):
         """Load bitfield from received bytes"""
         with self.lock:
-            for i, b in enumerate(data):
-                if i < self.num_pieces:
-                    self.pieces[i] = (b == 1)
+            for i in range(self.num_pieces):
+                byte_idx = i // 8
+                if byte_idx < len(data):
+                    bit_idx = 7 - (i % 8)  # High bit to low bit (0-7)
+                    self.pieces[i] = bool(data[byte_idx] & (1 << bit_idx))
 
     def has_interesting(self, other):
         """Return True if other has pieces we don't"""
@@ -369,36 +383,122 @@ def peer_process(my_peer_id):
 
     # Initialize logger
     logger = Logger(my_peer_id)
-    logger.log(f"Starting on {my_peer.host}:{my_peer.port}")
-    logger.file_status(my_peer.file_exist)
 
     # Create a directory for this peer's files if it doesn't exist
     peer_dir = f"peer_{my_peer_id}"
     os.makedirs(peer_dir, exist_ok=True)
-    logger.log(f"Created or verified directory '{peer_dir}'.")
 
     # Initialize bitfield
     num_pieces = (common['FileSize'] + common['PieceSize'] - 1) // common['PieceSize']
     bitfield = Bitfield(num_pieces)
-    if my_peer.file_exist:
+    started_with_file = my_peer.file_exist
+    if started_with_file:
         # If the peer starts with the full file, mark all pieces
         for i in range(num_pieces):
             bitfield.set_piece(i)
-    logger.log(f"Bitfield initialized with {num_pieces} pieces.")
 
     # Create a socket and bind it to the port from the config file
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((my_peer.host, my_peer.port))
+    # Use empty string to bind to all interfaces (I was getting a bunch of connection refused errors otherwise)
+    bind_host = '' if my_peer.host == 'localhost' else my_peer.host
+    server_socket.bind((bind_host, my_peer.port))
     server_socket.listen(5)
-    logger.log(f"Listening on port {my_peer.port}...")
+    server_socket.settimeout(1.0)  # Short timeout to allow checking for connections
 
     # Initialize message handler
     message_handler = MessageHandler(logger)
-    
+
     # List to hold active socket connections
     connections = []
     connection_info = {}  # Store connection info for each peer
+    connections_lock = threading.Lock() 
+
+    # Accept incoming connections from peers with higher IDs
+    # Accept connections as they come in, verify peer ID via handshake
+    expected_peers = [p.peer_id for p in peers if p.peer_id > my_peer_id]
+    accepted_peers = set()
+    accepted_peers_lock = threading.Lock()
+    
+    def accept_connections():
+        """Accept incoming connections in a separate thread"""
+        if not expected_peers:
+            return
+        
+        # Continue accepting connections until socket is closed
+        while True:
+            try:
+                # Check if socket is still valid
+                if server_socket.fileno() == -1:
+                    break
+                conn, addr = server_socket.accept()
+                
+                # Perform handshake (incoming connection sends handshake first)
+                received_handshake = message_handler.receive_handshake(conn)
+                peer_id_from_handshake = received_handshake.peer_id
+                
+                # Verify the peer ID is one we expect
+                if peer_id_from_handshake not in expected_peers:
+                    conn.close()
+                    continue
+                
+                with accepted_peers_lock:
+                    if peer_id_from_handshake in accepted_peers:
+                        conn.close()
+                        continue
+                    accepted_peers.add(peer_id_from_handshake)
+                
+                message_handler.send_handshake(conn, my_peer_id)
+                logger.connection_accepted(peer_id_from_handshake)
+                
+                with connections_lock:
+                    connections.append((peer_id_from_handshake, conn))
+                    connection_info[peer_id_from_handshake] = {
+                        'socket': conn,
+                        'choked': True,            # Start choked, will be unchoked by algorithm
+                        'interested': False,
+                        'bitfield': None,
+                        'requested': None,
+                        'bytes_downloaded': 0,     # Bytes downloaded in current interval
+                        'download_start_time': time.time(),  # Start time of current interval
+                        'is_preferred': False,      # Whether this peer is a preferred neighbor
+                        'is_optimistic': False      # Whether this peer is optimistically unchoked
+                    }
+                
+                # Exchange bitfields with the newly connected peer
+                try:
+                    # Send our bitfield if we have any pieces
+                    if bitfield.num_completed() > 0:
+                        message_handler.send_bitfield(conn, bitfield)
+                except Exception:
+                    pass
+                
+            except socket.timeout:
+                # Timeout is expected, continue waiting for connections
+                continue
+            except (OSError, socket.error):
+                # Socket was closed or invalid, exit accept thread
+                if server_socket.fileno() == -1:
+                    break
+                try:
+                    if 'conn' in locals():
+                        conn.close()
+                except:
+                    pass
+                continue
+            except Exception:
+                try:
+                    if 'conn' in locals():
+                        conn.close()
+                except:
+                    pass
+                continue
+    
+    # Start accepting connections in a separate thread
+    if expected_peers:
+        accept_thread = threading.Thread(target=accept_connections, daemon=True)
+        accept_thread.start()
+        time.sleep(0.2) 
 
     # Connect to peers with smaller peer IDs
     for p in peers:
@@ -406,45 +506,163 @@ def peer_process(my_peer_id):
             while True:
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(5.0)  # 5 second timeout for connection attempts
                     s.connect((p.host, p.port))
+                    s.settimeout(None)  # Remove timeout after connection
                     logger.connection_made(p.peer_id)
                     
-                    # Perform handshake
+                    # Perform handshake (outgoing connection sends handshake first)
                     message_handler.send_handshake(s, my_peer_id)
                     received_handshake = message_handler.receive_handshake(s)
                     
-                    connections.append((p.peer_id, s))
-                    connection_info[p.peer_id] = {
-                        'socket': s,
-                        'choked': False,           # simplified model: not using choking logic yet
-                        'interested': False,
-                        'bitfield': None,
-                        'requested': None          # track one outstanding request per peer
-                    }
+                    # Verify the peer ID matches
+                    if received_handshake.peer_id != p.peer_id:
+                        s.close()
+                        time.sleep(0.3)
+                        continue
+                    
+                    with connections_lock:
+                        connections.append((p.peer_id, s))
+                        connection_info[p.peer_id] = {
+                            'socket': s,
+                            'choked': True,            # Start choked, will be unchoked by algorithm
+                            'interested': False,
+                            'bitfield': None,
+                            'requested': None,         # track one outstanding request per peer
+                            'bytes_downloaded': 0,     # Bytes downloaded in current interval
+                            'download_start_time': time.time(),  # Start time of current interval
+                            'is_preferred': False,      # Whether this peer is a preferred neighbor
+                            'is_optimistic': False      # Whether this peer is optimistically unchoked
+                        }
                     break
-                except ConnectionRefusedError:
-                    # Keep retrying until peer’s listener is up
-                    time.sleep(0.3)
+                except (ConnectionRefusedError, socket.timeout, OSError):
+                    # Keep retrying until peer's listener is up
+                    try:
+                        s.close()
+                    except:
+                        pass
+                    time.sleep(0.5)
+                except Exception:
+                    try:
+                        s.close()
+                    except:
+                        pass
+                    time.sleep(0.5)
+    
+    # Wait for all expected incoming connections to be accepted
+    if expected_peers:
+        max_wait_time = 60  # Maximum 60 seconds to wait for connections
+        start_wait = time.time()
+        while len(accepted_peers) < len(expected_peers):
+            if time.time() - start_wait > max_wait_time:
+                break
+            time.sleep(0.5)
 
-    # Accept incoming connections from peers with higher IDs
-    for p in peers:
-        if p.peer_id > my_peer_id:
-            conn, addr = server_socket.accept()
-            logger.connection_accepted(p.peer_id)
+    def calculate_download_rate(peer_id):
+        """Calculate download rate for a peer in bytes per second"""
+        info = connection_info[peer_id]
+        elapsed = time.time() - info['download_start_time']
+        if elapsed > 0:
+            return info['bytes_downloaded'] / elapsed
+        return 0.0
+    
+    def select_preferred_neighbors():
+        """Select preferred neighbors based on download rates"""
+        # Get all interested peers
+        interested_peers = [pid for pid, info in connection_info.items() 
+                          if info['interested']]
+        
+        if not interested_peers:
+            return []
+        
+        # If we have complete file, select randomly
+        if bitfield.is_complete():
+            k = common['NumberOfPreferredNeighbors']
+            return random.sample(interested_peers, min(k, len(interested_peers)))
+        
+        # Otherwise, select based on download rates
+        peer_rates = []
+        # Calculate rates
+        for pid in interested_peers:
+            rate = calculate_download_rate(pid)
+            peer_rates.append((pid, rate))
+        
+        # Sort by download rate
+        peer_rates.sort(key=lambda x: x[1], reverse=True)
+        
+        # Select top k, breaking ties randomly
+        k = common['NumberOfPreferredNeighbors']
+        if len(peer_rates) <= k:
+            return [pid for pid, _ in peer_rates]
+        
+        # Find peers with same rate as k-th peer
+        kth_rate = peer_rates[k-1][1]
+        same_rate_peers = [pid for pid, rate in peer_rates if rate == kth_rate]
+        
+        # Select randomly to break ties
+        if len(same_rate_peers) > 1:
+            selected = [pid for pid, rate in peer_rates if rate > kth_rate]
+            needed = k - len(selected)
+            selected.extend(random.sample(same_rate_peers, needed))
+            return selected
+        
+        return [pid for pid, _ in peer_rates[:k]]
+    
+    def select_optimistic_unchoked():
+        """Select an optimistically unchoked neighbor randomly from choked but interested peers"""
+        choked_interested = [pid for pid, info in connection_info.items()
+                           if info['choked'] and info['interested']]
+        
+        if not choked_interested:
+            return None
+        
+        return random.choice(choked_interested)
+    
+    def update_choking():
+        """Update choking/unchoking based on preferred neighbors and optimistic unchoking"""
+        # Select preferred neighbors
+        preferred = select_preferred_neighbors()
+        
+        # Select optimistic unchoked neighbor
+        optimistic = select_optimistic_unchoked()
+        
+        # Update connection info
+        for pid, info in connection_info.items():
+            was_preferred = info['is_preferred']
+            was_optimistic = info['is_optimistic']
+            was_choked = info['choked']
             
-            # Perform handshake
-            received_handshake = message_handler.receive_handshake(conn)
-            message_handler.send_handshake(conn, my_peer_id)
+            info['is_preferred'] = (pid in preferred)
+            info['is_optimistic'] = (pid == optimistic)
             
-            connections.append((p.peer_id, conn))
-            connection_info[p.peer_id] = {
-                'socket': conn,
-                'choked': False,           # simplified model
-                'interested': False,
-                'bitfield': None,
-                'requested': None
-            }
-
+            # Determine if should be unchoked
+            should_unchoke = info['is_preferred'] or info['is_optimistic']
+            
+            # Send choke/unchoke messages if state changed
+            if should_unchoke and info['choked']:
+                try:
+                    message_handler.send_unchoke(info['socket'])
+                    info['choked'] = False
+                except Exception:
+                    pass
+            elif not should_unchoke and not info['choked']:
+                try:
+                    message_handler.send_choke(info['socket'])
+                    info['choked'] = True
+                    info['requested'] = None  
+                except Exception:
+                    pass
+        
+        if preferred:
+            logger.preferred_neighbors(preferred)
+        if optimistic is not None:
+            logger.optimistic_unchoked(optimistic)
+        
+        # Reset download tracking for next interval
+        for pid, info in connection_info.items():
+            info['bytes_downloaded'] = 0
+            info['download_start_time'] = time.time()
+    
     # Helper functions for file I/O and broadcasting
     def _ensure_placeholder():
         """Create placeholder file in peer_dir if missing"""
@@ -454,8 +672,8 @@ def peer_process(my_peer_id):
                 total_size = common['FileSize']
                 with open(file_path, 'wb') as f:
                     f.write(b'\x00' * total_size)
-            except Exception as e:
-                logger.log(f"Error creating placeholder file: {e}")
+            except Exception:
+                pass
 
     def _save_piece(piece_index, piece_data):
         """Save received piece into the file (creates placeholder file if necessary)"""
@@ -472,8 +690,8 @@ def peer_process(my_peer_id):
                 offset = piece_index * piece_size
                 f.seek(offset)
                 f.write(piece_data)
-        except Exception as e:
-            logger.log(f"Error saving piece {piece_index}: {e}")
+        except Exception:
+            pass
 
     def _read_piece(piece_index):
         """Read a piece from file (if exists)"""
@@ -483,8 +701,7 @@ def peer_process(my_peer_id):
             with open(file_path, 'rb') as f:
                 f.seek(piece_index * piece_size)
                 return f.read(piece_size)
-        except Exception as e:
-            logger.log(f"Error reading piece {piece_index}: {e}")
+        except Exception:
             return None
 
     def _broadcast_have(piece_index):
@@ -492,11 +709,13 @@ def peer_process(my_peer_id):
         for pid, sock in connections:
             try:
                 message_handler.send_have(sock, piece_index)
-            except Exception as e:
-                logger.log(f"Error broadcasting have to peer {pid}: {e}")
+            except Exception:
+                pass
 
     # After connecting, exchange bitfields with all connected peers
-    for peer_id, sock in connections:
+    with connections_lock:
+        connections_copy = list(connections)  # Make a copy to avoid connection change issues
+    for peer_id, sock in connections_copy:
         try:
             # Send our bitfield if we have any pieces
             if bitfield.num_completed() > 0:
@@ -504,10 +723,15 @@ def peer_process(my_peer_id):
             
             # Receive bitfield from peer
             try:
+                sock.settimeout(2.0)  # 2 second timeout for bitfield exchange
                 message = message_handler.receive_message(sock)
+                sock.settimeout(0.1)  # Reset to normal timeout for message loop
+                
                 if message is None:
-                    raise ValueError("No message received when expecting bitfield")
-                if message.message_type == MessageType.BITFIELD:
+                    # Peer didn't send bitfield, thus they have no pieces, thus we're not interested
+                    connection_info[peer_id]['bitfield'] = Bitfield(num_pieces)
+                    message_handler.send_not_interested(sock)
+                elif message.message_type == MessageType.BITFIELD:
                     bitfield_msg = BitfieldMessage.from_message(message)
                     peer_bitfield = Bitfield(num_pieces)
                     peer_bitfield.from_bytes(bitfield_msg.payload)
@@ -526,21 +750,29 @@ def peer_process(my_peer_id):
                     else:
                         message_handler.send_not_interested(sock)
                 else:
-                    # If peer did not send bitfield (allowed if they have no pieces), handle gracefully
-                    # We'll not force an error; continue with empty bitfield
                     connection_info[peer_id]['bitfield'] = Bitfield(num_pieces)
-            except Exception as e:
-                # If bitfield exchange fails, keep going but log
-                logger.log(f"Error receiving bitfield from peer {peer_id}: {e}")
+            except socket.timeout:
+                # Peer didn't send bitfield within timeout (they have no pieces)
+                sock.settimeout(0.1)  # Reset timeout
                 connection_info[peer_id]['bitfield'] = Bitfield(num_pieces)
-        except Exception as e:
-            logger.log(f"Error exchanging bitfield with peer {peer_id}: {e}")
+                # Since peer has no pieces, we're not interested
+                try:
+                    message_handler.send_not_interested(sock)
+                except:
+                    pass
+            except Exception:
+                sock.settimeout(0.1)  # Reset timeout
+                connection_info[peer_id]['bitfield'] = Bitfield(num_pieces)
+        except Exception:
+            pass
 
     # Main message handling loop
     def handle_messages():
         """Handle incoming messages from all peers"""
         while True:
-            for peer_id, sock in connections:
+            with connections_lock:
+                connections_copy = list(connections)  # Make a copy to avoid connection change issues
+            for peer_id, sock in connections_copy:
                 try:
                     sock.settimeout(0.1)
                     message = message_handler.receive_message(sock)
@@ -548,27 +780,29 @@ def peer_process(my_peer_id):
                         continue
                     
                     if message.message_type == MessageType.CHOKE:
-                        connection_info[peer_id]['choked'] = True
+                        # Peer is choking us, we can't request pieces from them
                         logger.choked_by(peer_id)
+                        connection_info[peer_id]['requested'] = None
                     
                     elif message.message_type == MessageType.UNCHOKE:
-                        connection_info[peer_id]['choked'] = False
+                        # Peer is unchoking us, we can request pieces from them
                         logger.unchoked_by(peer_id)
-                        # When unchoked, request a piece if available
-                        # choose a piece randomly that peer has and we don't
                         peer_bf = connection_info[peer_id]['bitfield']
-                        if peer_bf:
-                            candidates = []
-                            for i in range(num_pieces):
-                                if peer_bf.has_piece(i) and not bitfield.has_piece(i):
-                                    candidates.append(i)
-                            if candidates and connection_info[peer_id]['requested'] is None:
-                                choice = candidates[int(time.time() * 1000) % len(candidates)]
-                                try:
-                                    message_handler.send_request(sock, choice)
-                                    connection_info[peer_id]['requested'] = choice
-                                except Exception as e:
-                                    logger.log(f"Error sending request to peer {peer_id}: {e}")
+                        if peer_bf is None:
+                            peer_bf = Bitfield(num_pieces)
+                            connection_info[peer_id]['bitfield'] = peer_bf
+                        
+                        candidates = []
+                        for i in range(num_pieces):
+                            if peer_bf.has_piece(i) and not bitfield.has_piece(i):
+                                candidates.append(i)
+                        if candidates and connection_info[peer_id]['requested'] is None:
+                            choice = random.choice(candidates)
+                            try:
+                                message_handler.send_request(sock, choice)
+                                connection_info[peer_id]['requested'] = choice
+                            except Exception:
+                                pass
                     
                     elif message.message_type == MessageType.INTERESTED:
                         connection_info[peer_id]['interested'] = True
@@ -577,6 +811,32 @@ def peer_process(my_peer_id):
                     elif message.message_type == MessageType.NOT_INTERESTED:
                         connection_info[peer_id]['interested'] = False
                         logger.received_not_interested(peer_id)
+                    
+                    elif message.message_type == MessageType.BITFIELD:
+                        # Handle bitfield message for peers that connect late
+                        bitfield_msg = BitfieldMessage.from_message(message)
+                        peer_bitfield = Bitfield(num_pieces)
+                        peer_bitfield.from_bytes(bitfield_msg.payload)
+                        connection_info[peer_id]['bitfield'] = peer_bitfield
+                        
+                        # Check if peer has interesting pieces
+                        has_interesting = False
+                        for i in range(num_pieces):
+                            if peer_bitfield.has_piece(i) and not bitfield.has_piece(i):
+                                has_interesting = True
+                                break
+                        
+                        if has_interesting:
+                            try:
+                                message_handler.send_interested(sock)
+                                connection_info[peer_id]['interested'] = True
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                message_handler.send_not_interested(sock)
+                            except Exception:
+                                pass
                     
                     elif message.message_type == MessageType.HAVE:
                         # unpack piece index from payload
@@ -593,29 +853,30 @@ def peer_process(my_peer_id):
                             try:
                                 message_handler.send_interested(sock)
                                 connection_info[peer_id]['interested'] = True
-                            except Exception as e:
-                                logger.log(f"Error sending interested to peer {peer_id}: {e}")
+                            except Exception:
+                                pass
                     
                     elif message.message_type == MessageType.REQUEST:
                         # Peer requests a piece from us
                         piece_index = struct.unpack('>I', message.payload)[0]
-                        # In simplified model we always upload if we have the piece
-                        if bitfield.has_piece(piece_index):
+                        # Only send piece if we have it AND peer is not choked
+                        if bitfield.has_piece(piece_index) and not connection_info[peer_id]['choked']:
                             data = None
                             _ensure_placeholder()
                             data = _read_piece(piece_index)
                             if data is not None:
                                 try:
                                     message_handler.send_piece(sock, piece_index, data)
-                                except Exception as e:
-                                    logger.log(f"Error sending piece to peer {peer_id}: {e}")
+                                except Exception:
+                                    pass
                     
                     elif message.message_type == MessageType.PIECE:
                         # receive piece payload and save
                         piece_index = struct.unpack('>I', message.payload[:4])[0]
                         piece_data = message.payload[4:]
                         
-                        # Save the piece
+                        connection_info[peer_id]['bytes_downloaded'] += len(piece_data)
+                        
                         _save_piece(piece_index, piece_data)
                         
                         # Update bitfield
@@ -626,8 +887,28 @@ def peer_process(my_peer_id):
                         if connection_info[peer_id]['requested'] == piece_index:
                             connection_info[peer_id]['requested'] = None
                         
+                        # Check if we just completed the file
+                        if bitfield.is_complete() and not started_with_file:
+                            logger.download_complete()
+                        
                         # Broadcast HAVE to all peers
                         _broadcast_have(piece_index)
+                        
+                        # If still unchoked, request another piece from this peer
+                        if not connection_info[peer_id]['choked']:
+                            peer_bf = connection_info[peer_id]['bitfield']
+                            if peer_bf:
+                                candidates = []
+                                for i in range(num_pieces):
+                                    if peer_bf.has_piece(i) and not bitfield.has_piece(i):
+                                        candidates.append(i)
+                                if candidates and connection_info[peer_id]['requested'] is None:
+                                    choice = random.choice(candidates)
+                                    try:
+                                        message_handler.send_request(connection_info[peer_id]['socket'], choice)
+                                        connection_info[peer_id]['requested'] = choice
+                                    except Exception:
+                                        pass
                         
                 except socket.timeout:
                     # No message available, continue to next peer
@@ -636,28 +917,103 @@ def peer_process(my_peer_id):
                     # If a peer disconnects or any other error happens, ignore and continue
                     continue
             
-            # Check if download is complete
-            if bitfield.is_complete():
-                logger.download_complete()
-                break
-            
-            time.sleep(0.1)  # Small delay to prevent busy waiting
+            # Check if download is complete and all peers have completed
+            time.sleep(0.1)  
 
-    # Start message handling in a separate thread
     message_thread = threading.Thread(target=handle_messages, daemon=True)
     message_thread.start()
+    
+    # Periodic unchoking timer
+    def unchoking_timer():
+        """Periodically update preferred neighbors"""
+        while True:
+            time.sleep(common['UnchokingInterval'])
+            try:
+                update_choking()
+            except Exception:
+                pass
+    
+    # Periodic optimistic unchoking timer
+    def optimistic_unchoking_timer():
+        """Periodically update optimistic unchoked neighbor"""
+        while True:
+            time.sleep(common['OptimisticUnchokingInterval'])
+            try:
+                # Only update optimistic unchoked, not preferred neighbors
+                optimistic = select_optimistic_unchoked()
+                if optimistic is not None:
+                    # Update optimistic unchoked neighbor
+                    old_optimistic = None
+                    for pid, info in connection_info.items():
+                        if info['is_optimistic']:
+                            old_optimistic = pid
+                            info['is_optimistic'] = False
+                            if not info['is_preferred']:
+                                try:
+                                    message_handler.send_choke(info['socket'])
+                                    info['choked'] = True
+                                    info['requested'] = None
+                                except:
+                                    pass
+                    
+                    # Set new optimistic unchoked
+                    if optimistic != old_optimistic:
+                        connection_info[optimistic]['is_optimistic'] = True
+                        if connection_info[optimistic]['choked']:
+                            try:
+                                message_handler.send_unchoke(connection_info[optimistic]['socket'])
+                                connection_info[optimistic]['choked'] = False
+                                logger.optimistic_unchoked(optimistic)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+    
+    # Start periodic timers
+    unchoking_thread = threading.Thread(target=unchoking_timer, daemon=True)
+    unchoking_thread.start()
+    
+    optimistic_thread = threading.Thread(target=optimistic_unchoking_timer, daemon=True)
+    optimistic_thread.start()
+    
+    # Initial unchoking update
+    time.sleep(0.5)  # Give connections time to establish
+    update_choking()
 
-    # Keep peer process alive (simulating a running node)
     try:
         while True:
             time.sleep(2)
-            # If we become complete, break and allow graceful shutdown
+            # Check if we and all peers have completed
             if bitfield.is_complete():
-                logger.download_complete()
-                break
+                # Check if all peers from the config have completed
+                all_peers_complete = True
+                all_peer_ids = {p.peer_id for p in peers}
+                
+                # First, check if we have connections to all peers
+                connected_peer_ids = set(connection_info.keys())
+                if connected_peer_ids != all_peer_ids - {my_peer_id}:
+                    # Not all peers are connected yet
+                    all_peers_complete = False
+                else:
+                    # All peers are connected, check if they all have the file
+                    for pid in all_peer_ids:
+                        if pid == my_peer_id:
+                            continue
+                        if pid not in connection_info:
+                            all_peers_complete = False
+                            break
+                        peer_bf = connection_info[pid]['bitfield']
+                        if peer_bf is None or not peer_bf.is_complete():
+                            all_peers_complete = False
+                            break
+                
+                if all_peers_complete:
+                    if not started_with_file:
+                        logger.download_complete()
+                    break
                 
     except KeyboardInterrupt:
-        logger.shutdown()
+        pass
     finally:
         server_socket.close()
         for _, s in connections:
@@ -665,7 +1021,6 @@ def peer_process(my_peer_id):
                 s.close()
             except:
                 pass
-        logger.log("Connections closed. Peer exiting.")
 
 
 if __name__ == "__main__":
