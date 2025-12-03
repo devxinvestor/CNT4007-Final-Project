@@ -63,6 +63,14 @@ class Logger:
     def optimistic_unchoked(self, peer_id):
         """Log optimistically unchoked neighbor change"""
         self.log(f"has the optimistically unchoked neighbor {peer_id}.")
+    
+    def sent_bitfield(self, peer_id):
+        """Log sending bitfield message"""
+        self.log(f"sends 'bitfield' message to Peer {peer_id}.")
+    
+    def received_bitfield(self, peer_id):
+        """Log receiving bitfield message"""
+        self.log(f"received the 'bitfield' message from {peer_id}.")
 
 
 
@@ -470,6 +478,7 @@ def peer_process(my_peer_id):
                     # Send our bitfield if we have any pieces
                     if bitfield.num_completed() > 0:
                         message_handler.send_bitfield(conn, bitfield)
+                        logger.sent_bitfield(peer_id_from_handshake)
                 except Exception:
                     pass
                 
@@ -715,6 +724,7 @@ def peer_process(my_peer_id):
             # Send our bitfield if we have any pieces
             if bitfield.num_completed() > 0:
                 message_handler.send_bitfield(sock, bitfield)
+                logger.sent_bitfield(peer_id)
             
             # Receive bitfield from peer
             try:
@@ -727,6 +737,7 @@ def peer_process(my_peer_id):
                     connection_info[peer_id]['bitfield'] = Bitfield(num_pieces)
                     message_handler.send_not_interested(sock)
                 elif message.message_type == MessageType.BITFIELD:
+                    logger.received_bitfield(peer_id)
                     bitfield_msg = BitfieldMessage.from_message(message)
                     peer_bitfield = Bitfield(num_pieces)
                     peer_bitfield.from_bytes(bitfield_msg.payload)
@@ -809,6 +820,7 @@ def peer_process(my_peer_id):
                     
                     elif message.message_type == MessageType.BITFIELD:
                         # Handle bitfield message for peers that connect late
+                        logger.received_bitfield(peer_id)
                         bitfield_msg = BitfieldMessage.from_message(message)
                         peer_bitfield = Bitfield(num_pieces)
                         peer_bitfield.from_bytes(bitfield_msg.payload)
