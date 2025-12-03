@@ -400,9 +400,9 @@ def peer_process(my_peer_id):
     # Create a socket and bind it to the port from the config file
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    # Use empty string to bind to all interfaces (I was getting a bunch of connection refused errors otherwise)
-    bind_host = '' if my_peer.host == 'localhost' else my_peer.host
-    server_socket.bind((bind_host, my_peer.port))
+    # Bind to all interfaces (empty string) to accept connections from any interface
+    # This is necessary for network connections to work properly
+    server_socket.bind(('', my_peer.port))
     server_socket.listen(5)
     server_socket.settimeout(1.0)  # Short timeout to allow checking for connections
 
