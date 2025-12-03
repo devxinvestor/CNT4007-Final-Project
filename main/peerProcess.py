@@ -522,7 +522,7 @@ def peer_process(my_peer_id):
                         continue
                     
                     with connections_lock:
-                        connections.append((p.peer_id, s))
+                    connections.append((p.peer_id, s))
                         connection_info[p.peer_id] = {
                             'socket': s,
                             'choked': True,            # Start choked, will be unchoked by algorithm
@@ -549,14 +549,9 @@ def peer_process(my_peer_id):
                         pass
                     time.sleep(0.5)
     
-    # Wait for all expected incoming connections to be accepted
-    if expected_peers:
-        max_wait_time = 60  # Maximum 60 seconds to wait for connections
-        start_wait = time.time()
-        while len(accepted_peers) < len(expected_peers):
-            if time.time() - start_wait > max_wait_time:
-                break
-            time.sleep(0.5)
+    # Give a short time for initial connections to be established
+    # But don't block - start transferring with whatever peers are connected
+    time.sleep(1.0)  # Brief pause to allow some connections to establish
 
     def calculate_download_rate(peer_id):
         """Calculate download rate for a peer in bytes per second"""
