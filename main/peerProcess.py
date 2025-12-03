@@ -522,7 +522,7 @@ def peer_process(my_peer_id):
                         continue
                     
                     with connections_lock:
-                    connections.append((p.peer_id, s))
+                        connections.append((p.peer_id, s))
                         connection_info[p.peer_id] = {
                             'socket': s,
                             'choked': True,            # Start choked, will be unchoked by algorithm
