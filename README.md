@@ -45,7 +45,7 @@ We all created a File Sharing Systemn that allowed use to connect to each other 
 
 
 -- Who did What
-Devin: Set up the repo environemt adn started  working on the creating the peerProcess file and making sure it works within the environemt
+Devin: Set up the repo environment and started working on the creating the peerProcess file and making sure it works within the environment. I also implemented working message flow, bitfield exchange, and piece transfer logic.
 
 Jonathan: Helped to create the handshake message and the bitfield message and helped with working on the file exchange and finalizing the code.
 
